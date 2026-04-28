@@ -10,6 +10,13 @@ const sequelize = new Sequelize(
     port: env.DB_PORT,
     dialect: 'postgres',
     logging: env.NODE_ENV === 'development' ? console.log : false,
+    dialectOptions: {
+      ssl: {
+        require: true,
+        // This reads the certificate downloaded by your prestart script
+        ca: fs.readFileSync(path.join(__dirname, '../../root.crt')).toString()
+      }
+    },
     pool: {
       max: 20,
       min: 0,
