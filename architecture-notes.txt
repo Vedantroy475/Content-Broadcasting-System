@@ -1,0 +1,425 @@
+================================================================================
+CONTENT BROADCASTING SYSTEM — ARCHITECTURE & DESIGN DOCUMENT
+================================================================================
+Tech Stack: Node.js (Express) | PostgreSQL | JWT + bcrypt | Multer | Appwrite Storage
+================================================================================
+
+1. AUTHENTICATION & RBAC FLOW
+================================================================================
+1.1 Registration Flow (Principal seeded manually / Teacher invited)
+    • Principal is pre-seeded into the Users table (role = 'principal').
+    • Teachers register via a protected endpoint (only Principal can create new
+      teacher accounts), OR an open registration with manual role assignment.
+    • Passwords are hashed with bcrypt (saltRounds = 12) before storage.
+
+1.2 Login Flow
+    • POST /auth/login → accepts email + password.
+    • Server validates credentials against the Users table.
+    • On success, issues a JWT (access token) with payload:
+      { userId, email, role, iat, exp }.
+    • Token expiry: 24 hours (configurable).
+    • Token is sent in Authorization: Bearer <token> header for all protected
+      routes.
+
+1.3 RBAC Enforcement
+    • Every protected route passes through authMiddleware which:
+      a) Verifies token signature & expiry.
+      b) Attaches decoded user object (req.user) to the request.
+    • roleMiddleware('principal') or roleMiddleware('teacher') is stacked after
+      authMiddleware to enforce route-level access:
+      • Principal-only: GET /content/all, PATCH /content/:id/approve
+      • Teacher-only: POST /content/upload, GET /content/my-content
+      • Mixed (authenticated): GET /profile, etc.
+    • RBAC is enforced at both middleware layer AND service layer (defense in
+      depth). Service functions check req.user.role before executing logic.
+
+1.4 Token Refresh Strategy (Optional but good for scalability)
+    • Short-lived access tokens (15 min) + long-lived refresh tokens (7 days)
+      stored in httpOnly cookies or a RefreshTokens table.
+
+================================================================================
+2. SUBJECT-BASED SYSTEM DESIGN
+================================================================================
+2.1 Subject Modeling
+    • Subjects are stored in a Subjects lookup table (normalized design):
+      id | name (maths, science, english, ...) | created_at
+    • Content.subject is a foreign key referencing Subjects.id.
+    • This allows dynamic addition of subjects without schema changes and
+      enables subject-wise analytics later.
+
+2.2 Teacher-Subject Association
+    • A TeacherSubjects junction table links teachers to subjects they teach:
+      teacher_id | subject_id
+    • During upload, the system validates that the teacher is authorized to
+      upload for the requested subject (optional enforcement for stricter RBAC).
+
+2.3 Public Broadcasting by Teacher + Subject
+    • The public endpoint is: GET /content/live/:teacherId
+    • The service layer:
+      a) Fetches all APPROVED content where uploaded_by = teacherId.
+      b) Filters content whose current time falls within
+         [start_time, end_time].
+      c) Groups active content by subject.
+      d) Applies rotation logic per subject independently.
+      e) Returns the currently active content item for each subject, OR
+         a single active item if the API returns one per request.
+
+================================================================================
+3. UPLOAD HANDLING APPROACH
+================================================================================
+3.1 Middleware: Multer
+    • multer.memoryStorage() keeps uploaded files in memory as buffers.
+    • Files are not persisted to local disk during the upload flow.
+    • FileFilter: allow only image/jpeg, image/png, image/gif.
+    • Limits: fileSize = 10 * 1024 * 1024 bytes (10 MB).
+    • The in-memory buffer is passed to uploadService for Appwrite upload.
+
+3.2 Validation Layer
+    • Before Multer: express-validator checks title, subject, start_time,
+      end_time, rotation_duration.
+    • After Multer: if validation fails, the request is rejected before any
+      Appwrite file is created, avoiding orphaned cloud files.
+    • start_time must be < end_time. Both must be in the future at upload time
+      (optional business rule).
+
+3.3 File Metadata Storage
+    • On successful upload, insert into Content table:
+      - file_path (NULL for Appwrite-backed uploads)
+      - file_url (public Appwrite Storage view URL)
+      - file_type (mime type)
+      - file_size (bytes)
+    • Content status defaults to 'uploaded', then transitions to 'pending'.
+
+3.4 Appwrite Storage Integration (Configured via Environment Variables)
+    • Appwrite credentials and bucket config are loaded from environment
+      variables: APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, APPWRITE_API_KEY,
+      and APPWRITE_BUCKET_ID.
+    • uploadService uses node-appwrite Storage.createFile() with ID.unique()
+      and InputFile.fromBuffer(file.buffer, file.originalname).
+    • The file_url field stores the generated Appwrite view URL; local
+      file_path is NULL.
+    • Bucket permissions can be configured in Appwrite for public view access,
+      or tightened later if private/signed access is required.
+
+================================================================================
+4. APPROVAL WORKFLOW DESIGN
+================================================================================
+4.1 Status Lifecycle
+    uploaded → pending → approved / rejected
+
+    uploaded:   File received, metadata stored, awaiting teacher submission.
+    pending:    Teacher has finalized the upload; now visible to Principal.
+    approved:   Principal approved. Content becomes eligible for broadcasting.
+    rejected:   Principal rejected. rejection_reason is stored and visible to
+                the teacher.
+
+4.2 Principal Actions
+    • GET  /content/pending       → list all content with status = 'pending'.
+    • GET  /content/all           → list all content (with filters).
+    • PATCH /content/:id/approve  → set status='approved', approved_by=principalId,
+                                    approved_at=NOW().
+    • PATCH /content/:id/reject   → requires rejection_reason in body.
+                                    Sets status='rejected'.
+
+4.3 Teacher Visibility
+    • GET /content/my-content returns all content uploaded by the teacher.
+    • If status = 'rejected', the rejection_reason is included in the response.
+    • Teachers cannot modify content once it has been approved or rejected.
+
+4.4 Audit Trail (Optional Enhancement)
+    • ContentStatusHistory table logs every status transition with timestamp
+      and actor for full traceability.
+
+================================================================================
+5. SCHEDULING / ROTATION LOGIC (VERY IMPORTANT)
+================================================================================
+5.1 Data Model
+    • ContentSchedule table links content to time windows and rotation params:
+      id | content_id (FK) | start_time (TIMESTAMP) | end_time (TIMESTAMP)
+      | rotation_duration (INTEGER, minutes) | rotation_order (INTEGER)
+
+    • A subject-based rotation is achieved by grouping ContentSchedule rows
+      by Content.subject for a given teacher.
+
+5.2 Time-Window Check (Pre-Rotation)
+    For a given teacher and current time T = NOW():
+      active_schedules = SELECT * FROM content_schedule cs
+                         JOIN content c ON cs.content_id = c.id
+                         WHERE c.uploaded_by = :teacherId
+                           AND c.status = 'approved'
+                           AND cs.start_time <= T
+                           AND cs.end_time >= T;
+
+    If active_schedules is empty → return "No content available".
+
+5.3 Rotation Algorithm (Per Subject)
+    Given a list of approved, time-active content items for a single subject,
+    each with a rotation_duration (minutes):
+
+    Step 1 — Compute total cycle length:
+      total_cycle = SUM(rotation_duration) across all active items in subject.
+
+    Step 2 — Compute elapsed time within the cycle:
+      elapsed = EXTRACT(EPOCH FROM (T - MIN(start_time))) % total_cycle
+      (Using the earliest start_time among active items as the epoch base).
+
+    Step 3 — Determine active item:
+      Iterate through items sorted by rotation_order, accumulating durations
+      until cumulative_duration > elapsed. That item is the currently active one.
+
+    Pseudocode:
+      items = sorted active items by rotation_order ASC
+      total_cycle = sum(item.rotation_duration for item in items)
+      if total_cycle == 0: return null
+
+      epoch_start = min(item.start_time for item in items)
+      elapsed_seconds = (now - epoch_start).total_seconds()
+      position = elapsed_seconds % total_cycle
+
+      cumulative = 0
+      for item in items:
+          cumulative += item.rotation_duration * 60
+          if position < cumulative:
+              return item
+
+    This creates a deterministic, continuous loop without background jobs.
+
+5.4 Edge Cases in Scheduling
+    • No rotation_duration provided → default to a system constant (e.g., 5 min).
+    • Only one active item → always returns that item (loop of one).
+    • All items have zero duration → treat as static, return first item or
+      empty (choose consistent behavior and document it).
+    • Items with overlapping time windows but different subjects are handled
+      independently per subject.
+
+5.5 Why No Cron Job?
+    • The rotation is computed on-the-fly using the current timestamp.
+    • This eliminates the need for background workers, keeps the system
+      stateless, and scales horizontally.
+    • A future enhancement could use Redis + a scheduler for pre-computed
+      "next-up" notifications, but it is not required for correctness.
+
+================================================================================
+6. DATABASE DESIGN DECISIONS
+================================================================================
+6.1 PostgreSQL — Why?
+    • Native JSONB support for flexible metadata if needed later.
+    • Robust TIMESTAMP handling (with time zone) critical for scheduling logic.
+    • Excellent support for concurrent reads (public API can be hit heavily).
+    • ARRAY and ENUM types for cleaner schema (e.g., CREATE TYPE content_status
+      AS ENUM ('uploaded', 'pending', 'approved', 'rejected')).
+
+6.2 Table Design
+    Users
+    ─────
+    id            UUID PRIMARY KEY DEFAULT gen_random_uuid()
+    name          VARCHAR(100) NOT NULL
+    email         VARCHAR(255) UNIQUE NOT NULL
+    password_hash VARCHAR(255) NOT NULL
+    role          VARCHAR(20) CHECK (role IN ('principal', 'teacher'))
+    created_at    TIMESTAMPTZ DEFAULT NOW()
+
+    Subjects
+    ────────
+    id         SERIAL PRIMARY KEY
+    name       VARCHAR(50) UNIQUE NOT NULL
+    created_at TIMESTAMPTZ DEFAULT NOW()
+
+    Content
+    ───────
+    id               UUID PRIMARY KEY DEFAULT gen_random_uuid()
+    title            VARCHAR(255) NOT NULL
+    description      TEXT
+    subject_id       INTEGER REFERENCES Subjects(id)
+    file_path        VARCHAR(500)       -- NULL for Appwrite-backed uploads
+    file_url         VARCHAR(500)       -- Appwrite Storage view URL
+    file_type        VARCHAR(50)
+    file_size        INTEGER            -- bytes
+    uploaded_by      UUID REFERENCES Users(id)
+    status           VARCHAR(20) DEFAULT 'uploaded'
+    rejection_reason TEXT
+    approved_by      UUID REFERENCES Users(id)
+    approved_at      TIMESTAMPTZ
+    created_at       TIMESTAMPTZ DEFAULT NOW()
+
+    ContentSchedule
+    ───────────────
+    id                  UUID PRIMARY KEY DEFAULT gen_random_uuid()
+    content_id          UUID REFERENCES Content(id) ON DELETE CASCADE
+    start_time          TIMESTAMPTZ NOT NULL
+    end_time            TIMESTAMPTZ NOT NULL
+    rotation_duration   INTEGER DEFAULT 5   -- minutes
+    rotation_order      INTEGER DEFAULT 0   -- 0,1,2,...
+    created_at          TIMESTAMPTZ DEFAULT NOW()
+    CONSTRAINT valid_window CHECK (end_time > start_time)
+
+    TeacherSubjects (Optional)
+    ───────────────
+    teacher_id UUID REFERENCES Users(id)
+    subject_id INTEGER REFERENCES Subjects(id)
+    PRIMARY KEY (teacher_id, subject_id)
+
+6.3 Indexes for Performance
+    • Users: idx_users_email (for login lookups)
+    • Content: idx_content_uploaded_by_status, idx_content_subject_status
+    • ContentSchedule: idx_cs_times (start_time, end_time) for time-window queries
+
+================================================================================
+7. FOLDER STRUCTURE
+================================================================================
+content-broadcasting-system/
+├── src/
+│   ├── config/
+│   │   ├── database.js          # Sequelize / pg client setup
+│   │   ├── env.js               # Centralized env var loader (dotenv)
+│   │   └── multer.js            # Multer configuration
+│   ├── controllers/
+│   │   ├── authController.js
+│   │   ├── contentController.js
+│   │   ├── approvalController.js
+│   │   └── broadcastController.js
+│   ├── routes/
+│   │   ├── authRoutes.js
+│   │   ├── contentRoutes.js
+│   │   ├── approvalRoutes.js
+│   │   └── broadcastRoutes.js
+│   ├── services/
+│   │   ├── authService.js
+│   │   ├── contentService.js
+│   │   ├── approvalService.js
+│   │   ├── broadcastService.js   # Core scheduling/rotation logic
+│   │   └── uploadService.js
+│   ├── models/
+│   │   ├── index.js             # Sequelize associations & exports
+│   │   ├── User.js
+│   │   ├── Subject.js
+│   │   ├── Content.js
+│   │   ├── ContentSchedule.js
+│   │   └── TeacherSubject.js
+│   ├── middlewares/
+│   │   ├── authMiddleware.js    # JWT verification
+│   │   ├── roleMiddleware.js    # Role-based gate
+│   │   ├── uploadMiddleware.js  # Multer + file validation
+│   │   └── errorMiddleware.js   # Global error handler
+│   ├── utils/
+│   │   ├── asyncHandler.js      # Wrapper to catch async errors
+│   │   ├── ApiError.js          # Custom error class
+│   │   ├── ApiResponse.js       # Standardized response format
+│   │   └── constants.js         # Enums, defaults, magic numbers
+│   └── app.js                   # Express app setup
+├── tests/                       # Unit & integration tests
+├── architecture-notes.txt       # This file
+├── README.md
+├── .env.example
+├── .gitignore
+└── package.json
+
+================================================================================
+8. MIDDLEWARE USAGE
+================================================================================
+8.1 authMiddleware
+    • Verifies Bearer token from Authorization header.
+    • Decodes JWT using APP_SECRET.
+    • Queries Users table to ensure user still exists and is active.
+    • Attaches req.user = { id, email, role }.
+    • Throws 401 for missing/invalid/expired tokens.
+
+8.2 roleMiddleware(allowedRoles)
+    • Reads req.user.role.
+    • If role not in allowedRoles → 403 Forbidden.
+    • Composable: app.patch('/content/:id/approve', authMiddleware,
+      roleMiddleware(['principal']), approvalController.approve);
+
+8.3 uploadMiddleware
+    • Uses multer configured in src/config/multer.js.
+    • Uses memory storage so uploadService can send buffers to Appwrite.
+    • Handles file type and size validation.
+    • On rejection, responds with 400 before creating an Appwrite file.
+
+8.4 errorMiddleware (Global)
+    • Catches all errors from asyncHandler or next(error).
+    • Logs stack trace in development; sanitized message in production.
+    • Returns standardized JSON: { success: false, message, errors?, stack? }
+
+8.5 Validation Middleware (express-validator / Joi)
+    • Validates body/query/params before controllers execute.
+    • Returns 422 with detailed field-level errors.
+
+================================================================================
+9. SCALABILITY APPROACH (CACHING, QUEUES, ETC.)
+================================================================================
+9.1 Horizontal Scaling — Stateless Design
+    • Express app is stateless; no in-memory session store.
+    • JWT auth means any server instance can handle any request.
+    • File storage uses Appwrite Storage, so app instances do not depend on
+      shared local disk.
+
+9.2 Redis Caching (Bonus / Phase 2)
+    • Cache key for public API: live:teacher:{teacherId}:subject:{subjectId}
+    • TTL = min(rotation_duration, 60 seconds) to balance freshness vs load.
+    • On cache miss, compute rotation and store result.
+    • Cache invalidation: clear on content approval/rejection/schedule update.
+
+9.3 Rate Limiting (Bonus / Phase 2)
+    • express-rate-limit on public /content/live/:teacherId endpoints.
+    • Prevents abuse; configurable per IP or per student identifier.
+
+9.4 Database Connection Pooling
+    • Use Sequelize connection pool or pg.Pool with max 20 connections.
+    • In multi-instance deploy, ensure pool size * instances < DB max conns.
+
+9.5 Background Jobs (Future — Not Required for MVP)
+    • A lightweight queue (Bull + Redis) could handle:
+      - Post-approval notifications to teachers.
+      - Cleanup of expired content files.
+      - Analytics aggregation.
+
+9.6 File Delivery
+    • Appwrite Storage provides the persisted file object and view URL used by
+      the broadcast response.
+    • A future deployment can place a CDN in front of public file URLs or switch
+      to private bucket permissions with controlled access URLs if required.
+
+================================================================================
+10. EDGE CASE HANDLING MATRIX
+================================================================================
+Scenario                           → Behavior
+──────────────────────────────────────────────────────────────────────────────
+No approved content for teacher    → 200 OK with { message: "No content available" }
+Approved but outside time window   → 200 OK with { message: "No content available" }
+Invalid subject in query param     → 200 OK with { message: "No content available" }
+File size > 10MB                   → 400 Bad Request: "File exceeds 10MB limit"
+Invalid file type                  → 400 Bad Request: "Only JPG, PNG, GIF allowed"
+Missing title / subject            → 422 Validation Error
+Reject without reason              → 400 Bad Request: "Rejection reason required"
+Unauthorized approval attempt      → 403 Forbidden
+Expired JWT                        → 401 Unauthorized: "Token expired"
+Teacher edits approved content     → 403 Forbidden: "Cannot modify approved content"
+Rotation duration = 0 for all items→ Return first item (static display)
+
+================================================================================
+11. API ENDPOINT SUMMARY
+================================================================================
+Auth
+  POST /auth/register         (Principal creates Teacher — protected)
+  POST /auth/login
+  POST /auth/refresh
+
+Content (Teacher)
+  POST   /content/upload      (multipart/form-data)
+  GET    /content/my-content   (with filters: status, subject)
+  GET    /content/:id
+
+Approval (Principal)
+  GET    /content/pending
+  GET    /content/all          (filters: status, subject, teacher)
+  PATCH  /content/:id/approve
+  PATCH  /content/:id/reject
+
+Broadcast (Public — No Auth)
+  GET    /content/live/:teacherId
+  GET    /content/live/:teacherId?subject=maths   (optional filter)
+
+================================================================================
+END OF DOCUMENT
+================================================================================
